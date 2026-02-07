@@ -32,6 +32,7 @@ from automation import (
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from telegram.error import NetworkError, TimedOut, RetryAfter
+from sessions_manager import has_valid_plan
 
 # ================= EXECUTORES =================
 # executor rápido: login, sms, menu, consulta
@@ -91,24 +92,77 @@ async def run_collect(func, *args):
     return await loop.run_in_executor(EXECUTOR_COLLECT, lambda: func(*args))
 
 
+async def block_no_plan(query_or_msg, is_query=False):
+    text = (
+        "🚫 **Acesso bloqueado**\n\n"
+        "Seu plano expirou ou você não possui um plano ativo.\n\n"
+        "Para continuar, adquira um plano:"
+    )
+
+    if is_query:
+        await query_or_msg.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_payment_keyboard(),
+        )
+    else:
+        await query_or_msg.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_payment_keyboard(),
+        )
+
+
+async def maybe_send_trial_message(update: Update, session: dict):
+    """
+    Envia a mensagem de teste apenas UMA vez
+    e apenas para usuários em período de teste
+    """
+    if not session.get("is_trial"):
+        return
+
+    if session.get("trial_notified"):
+        return
+
+    days = (
+        datetime.strptime(session["expiration"], "%Y-%m-%d %H:%M:%S") - datetime.now()
+    ).days + 1
+
+    await update.message.reply_text(
+        f"🎁 **Teste liberado!**\n\n"
+        f"Você ganhou **{days} dias de acesso gratuito** para testar o bot.\n\n"
+        "Aproveite enquanto o teste estiver ativo 🚀",
+        parse_mode="Markdown",
+    )
+
+    update_user_session(update.effective_user.id, {"trial_notified": True})
+
+
 # ================= HELPERS =================
-def format_phone_br(phone: str) -> str:
+def format_phone_br(phone: str | None) -> str:
+    if not phone:
+        return "—"
+
     digits = "".join(filter(str.isdigit, phone))
 
     if len(digits) == 11:
-        ddd = digits[:2]
-        first = digits[2]
-        part1 = digits[3:7]
-        part2 = digits[7:]
-        return f"({ddd}) {first} {part1}-{part2}"
-
+        return f"({digits[:2]}) {digits[2]} {digits[3:7]}-{digits[7:]}"
     if len(digits) == 10:
-        ddd = digits[:2]
-        part1 = digits[2:6]
-        part2 = digits[6:]
-        return f"({ddd}) {part1}-{part2}"
+        return f"({digits[:2]}) {digits[2:6]}-{digits[6:]}"
 
     return phone
+
+
+def format_validade(session: dict) -> str:
+    exp = session.get("expiration")
+    if not exp:
+        return "—"
+
+    try:
+        dt = datetime.strptime(exp, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return "—"
 
 
 # ================= MENUS =================
@@ -145,6 +199,21 @@ def get_start_keyboard():
     )
 
 
+def get_payment_keyboard_public():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💳 Comprar plano", callback_data="payment_buy")]]
+    )
+
+
+def get_payment_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Comprar plano", callback_data="payment_buy")],
+            [InlineKeyboardButton("🏠 Voltar", callback_data="back_main")],
+        ]
+    )
+
+
 # ================= TELAS =================
 async def send_initial_flow(update: Update):
     name = update.effective_user.first_name or "🙂"
@@ -166,7 +235,7 @@ async def send_main_menu_from_query(query, session):
         "━━━━━━━━━━━━━━━━\n"
         f"👤 Usuário: {query.from_user.first_name}\n"
         f"📞 Vivo: `{format_phone_br(session.get('phone',''))}`\n"
-        "📅 Validade: `Sem`\n"
+        f"📅 Validade: `{format_validade(session)}`\n"
         "━━━━━━━━━━━━━━━━\n"
         "Escolha uma opção:"
     )
@@ -185,7 +254,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not session.get("token") or not session.get("wallet"):
         update_user_session(user_id, {"step": STEP_ASK_PHONE})
+
+        await maybe_send_trial_message(update, session)  # 👈 AQUI
         await send_initial_flow(update)
+
         return
 
     await update.message.reply_text(
@@ -193,11 +265,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━\n"
         f"👤 Usuário: {update.effective_user.first_name}\n"
         f"📞 Vivo: `{format_phone_br(session.get('phone',''))}`\n"
-        "📅 Validade: `Sem`\n"
+        f"📅 Validade: `{format_validade(session)}`\n"
         "━━━━━━━━━━━━━━━━\n"
         "Escolha uma opção:",
         parse_mode="Markdown",
         reply_markup=get_main_menu_keyboard(),
+    )
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = get_user_session(user_id)
+
+    # ❌ não está logado
+    if not session.get("token") or not session.get("wallet"):
+        await update.message.reply_text(
+            "⚠️ Você precisa estar **logado com um número Vivo** para acessar o menu.",
+            parse_mode="Markdown",
+        )
+
+        await send_initial_flow(update)
+        return
+
+    # 🔒 plano expirado
+    if not has_valid_plan(session):
+        await block_no_plan(update.message, is_query=False)
+        return
+
+    # ✅ logado → menu
+    await update.message.reply_text(
+        "📱 **PAINEL VIVO FREE**\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"👤 Usuário: {update.effective_user.first_name}\n"
+        f"📞 Vivo: `{format_phone_br(session.get('phone',''))}`\n"
+        f"📅 Validade: `{format_validade(session)}`\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "Escolha uma opção:",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard(),
+    )
+
+
+async def trocar_numero_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name or "🙂"
+
+    update_user_session(
+        user_id,
+        {
+            "step": STEP_ASK_PHONE,
+            "phone": "",
+            "token": "",
+            "wallet": "",
+        },
+    )
+
+    await update.message.reply_text(
+        "📱 Digite seu novo número **VIVO** com DDD:\n\n" "(ex: 11987660011)",
+        parse_mode="Markdown",
+    )
+
+
+async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = get_user_session(update.effective_user.id)
+
+    text = (
+        "🚧 **Pagamento temporariamente indisponível.**\n\n"
+        "A compra de planos ainda não está disponível."
+    )
+
+    # se estiver logado → botão voltar
+    keyboard = (
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 Voltar ao menu", callback_data="back_main")]]
+        )
+        if session.get("token") and session.get("wallet")
+        else None
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
 
@@ -259,7 +408,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "━━━━━━━━━━━━━━━━\n"
                 f"👤 Usuário: {update.effective_user.first_name}\n"
                 f"📞 Vivo: `{format_phone_br(session.get('phone',''))}`\n"
-                "📅 Validade: `Sem`\n"
+                f"📅 Validade: `{format_validade(session)}`\n"
                 "━━━━━━━━━━━━━━━━\n"
                 "Escolha uma opção:",
                 parse_mode="Markdown",
@@ -292,7 +441,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(uid)
 
     try:
+
+        if query.data == "payment_buy":
+            text = (
+                "🚧 **Pagamento temporariamente indisponível.**\n\n"
+                "A compra de planos ainda não está disponível."
+            )
+
+            keyboard = (
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🏠 Voltar ao menu", callback_data="back_main"
+                            )
+                        ]
+                    ]
+                )
+                if session.get("token") and session.get("wallet")
+                else None
+            )
+
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            return
         if query.data == "btn_vivo_login":
+
+            if not has_valid_plan(session):
+                await block_no_plan(query, is_query=True)
+                return
+
             update_user_session(
                 uid,
                 {
@@ -304,13 +485,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             await query.edit_message_text(
-                "📱 Digite seu número Vivo com DDD:\n\n(ex: 11987660011)."
+                "📱 Digite seu número Vivo com DDD:\n\n(ex: 11987660011)"
             )
 
         elif query.data == "back_main":
             await send_main_menu_from_query(query, session)
 
         elif query.data == "menu_consultar":
+
+            if not has_valid_plan(session):
+                await block_no_plan(query, is_query=True)
+                return
+
             await query.edit_message_text("🔄 Analisando campanhas...")
 
             campaigns = await run_fast(
@@ -373,6 +559,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif query.data == "menu_coletar":
+
+            if not has_valid_plan(session):
+                await block_no_plan(query, is_query=True)
+                return
             if USER_COLLECTING[uid]:
                 await query.answer("⏳ Coleta em andamento...", show_alert=False)
                 return
@@ -476,6 +666,9 @@ def main():
         .build()
     )
 
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("numero", trocar_numero_cmd))
+    app.add_handler(CommandHandler("pagamento", payment_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
