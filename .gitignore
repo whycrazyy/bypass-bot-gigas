@@ -1,0 +1,19 @@
+# venv
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# env
+.env
+
+# sessions / dados
+*.json
+sessions/
+data/
+
+# logs
+*.log
+
+# OS
+.DS_Store
